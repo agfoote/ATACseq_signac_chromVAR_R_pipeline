@@ -1,0 +1,384 @@
+---
+title: "Motif Analysis for ATAC-seq using Signac and chromVAR"
+author: "Alexander G. Foote"
+date: "`r Sys.Date()`"
+output: html_document
+---
+This workflow demonstrates how to integrate motif annotation, chromVAR motif activity scoring, differential motif analysis, and motif enrichment analysis into your ATAC-seq pipeline using Signac. Adjust thresholds, cell type identifiers, and plotting parameters as needed for your specific dataset.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document performs motif analysis on ATAC-seq data using the **Signac** and **chromVAR** packages. The workflow includes:
+- Loading data and required libraries.
+- Setting up motif annotation using matrices from the JASPAR database.
+- Adding motif annotations to the ATAC-seq object and running chromVAR.
+- Differential motif activity analysis.
+- Motif enrichment analysis on differentially accessible peaks.
+- Generating feature plots and heatmaps.
+- A final re-analysis on a mesothelium-only subset.
+
+For more details on the conceptual framework, please refer to the [Signac motif vignette](https://stuartlab.org/signac/articles/motif_vignette).
+
+### Setup Workspace
+```{r load}
+library(Signac)
+library(Seurat)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(patchwork)
+library(chromVAR)
+library(ggplot2)
+set.seed(1234)
+```
+
+## Load the pre-processed ATAC-seq object (here named Wt1pos) and set the default assay to "distal_peaks":
+```{r data-loading}
+Wt1pos <- readRDS("/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds/P8_ATAC_mesen_label_03042023.rds")
+Wt1pos@meta.data 
+```
+
+## Motif Annotation Setup
+
+Obtain motif position frequency matrices (pfm) from JASPAR and define a helper function to filter genome sequences.
+```{r motif-setup}
+# Get the motif matrices from the JASPAR database
+motif.pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# Helper function to keep only selected sequences from a BSgenome object
+keepBSgenomeSequences <- function(genome, seqnames) {
+  stopifnot(all(seqnames %in% seqnames(genome)))
+  genome@user_seqnames <- setNames(seqnames, seqnames)
+  genome@seqinfo <- genome@seqinfo[seqnames]
+  genome
+}
+
+# Filter for standard chromosomes (remove, for example, alternative scaffolds)
+main.chroms <- standardChromosomes(BSgenome.Mmusculus.UCSC.mm10)
+main.chroms <- main.chroms[-22]  # Adjust if necessary
+filtered_genome <- keepBSgenomeSequences(BSgenome.Mmusculus.UCSC.mm10, main.chroms)
+```
+
+## Adding Motif Information and Running chromVAR
+
+Here we add the motif annotations to our object and run chromVAR to compute per-cell motif activities.
+```{r add-motifs-chromVAR}
+# Add motif annotations to the object using the filtered genome
+Wt1pos <- AddMotifs(
+  object = Wt1pos,
+  genome = filtered_genome,
+  pfm = motif.pfm,
+  assay = "distal_peaks"
+)
+
+# Run chromVAR to calculate motif activities
+Wt1pos <- RunChromVAR(Wt1pos, genome = filtered_genome)
+DefaultAssay(Wt1pos) <- 'chromvar'
+```
+
+## Differential Motif Activity Analysis
+
+Set cell identities and perform differential testing on motif activity across cell types.
+```{r diff-motif-activity}
+# Define cell type levels (adjust these based on your object)
+my_levels <- c("AF1", "AF2", "Adh7+ AF2", "SC myoFB", "ASM", "VSM", "Pericyte", "Peribronchial FB", "Mesothelium")
+Idents(Wt1pos) <- factor(Idents(Wt1pos), levels = my_levels)
+
+# Save the current object with motif annotations
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds')
+saveRDS(Wt1pos, file = "P8-mesen_motifadded_chromVAR_01272025.rds")
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/csv')
+# Identify differentially active motifs using the chromVAR assay
+differential.activity <- FindAllMarkers(Wt1pos, only.pos = TRUE, assay = "chromvar")
+write.table(differential.activity, file = "P8-mesen_motifadded_chromVAR_celltypemotif_01272025.csv")
+
+# Scale data for further analysis
+Wt1pos <- ScaleData(Wt1pos, assay = "chromvar")
+
+# Subset to selected cell types for figure-specific analysis
+subset_obj <- subset(Wt1pos, idents = c("AF1", "SC myoFB", "Pericyte"))
+subset_obj <- ScaleData(subset_obj, assay = "chromvar")
+differential.activity1 <- FindAllMarkers(subset_obj, only.pos = TRUE, assay = "chromvar")
+write.table(differential.activity1, file = "P8-mesen_motifadded_chromVAR_3celltype_onlyforFig_01272025.csv")
+```
+
+### Heatmap of Differential Motif Activity
+
+Generate a heatmap for selected motifs (using an external annotation file if available).
+```{r heatmap}
+# Read in additional motif annotations (ensure the file exists in your working directory)
+motif <- read.delim(file = "P8-mesen_motifadded_chromVAR_3celltype_onlyforFig_01292025_anno_refine_02012025.txt", header = TRUE)
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+pdf(paste(name, "_heatmap_withTF-3celltype_usedforFig_02012025.pdf", sep = ""))
+DoHeatmap(subset_obj, features = motif$gene, disp.min = -2, disp.max = 1.8) +
+  scale_fill_gradientn(colors = c("white", "red")) +
+  scale_y_discrete(labels = rev(motif$TF)) +
+  FontSize(y.text = 10)
+dev.off()
+```
+
+## Visualization
+###Feature Plots for Selected Motifs and Gene Accessibility
+
+First, plot motif activity for selected motifs. Then switch to the RNA assay to visualize gene accessibility.
+```{r feature-plots-motifs}
+# Read in Motif object 
+Wt1pos <- readRDS("/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds/P8-mesen_motifadded_chromVAR_01272025.rds") 
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+# Motif feature plots using the chromVAR assay
+DefaultAssay(Wt1pos) <- 'chromvar'
+name <- "P8-mesen_motifadded_chromVAR"
+pdf(paste(name, "_Ebf1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0154.4", order = TRUE, min.cutoff = 3, max.cutoff = 7, pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+pdf(paste(name, "_Cebpb_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0466.2", order = TRUE, min.cutoff = 2, max.cutoff = 4.5, pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+pdf(paste(name, "_Runx1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0002.2", order = TRUE, min.cutoff = 0.8, max.cutoff = 2.4, pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+# Switch to RNA assay to plot gene accessibility for comparison
+DefaultAssay(Wt1pos) <- "RNA"
+pdf(paste(name, "_Ebf1_accessibility_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "Ebf1", order = TRUE, pt.size = 0.2, min.cutoff = 1.5, max.cutoff = 2.5, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_Runx1_accessibility_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "Runx1", order = TRUE, pt.size = 0.2, min.cutoff = 1.8, max.cutoff = 2.4, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_Cebpb_accessibility_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "Cebpb", order = TRUE, pt.size = 0.2, min.cutoff = 0.8, max.cutoff = 1.25, cols = c('lightgrey', 'brown'))
+dev.off()
+```
+
+## Motif Enrichment Analysis on Differentially Accessible Peaks
+
+In this section we perform motif enrichment analyses on differentially accessible peaks between various cell types. In ATAC‑seq and scATAC (Signac) workflows, you very often see a distinction drawn between:
+	
+	•	All called *peaks* (which include everything from promoter‐proximal to deep intergenic sites), and
+	•	*Distal peaks* (peaks that lie a certain distance away—often >5kb— from any annotated transcription 
+	start site).
+
+Many analyses—and especially motif or co‑accessibility/enhancer‑focused studies—prefer to work on the distal_peaks set rather than the complete peaks assay. In summary, *distal peaks* is preferred over *peaks* assay when you want to zero in on true regulatory elements (enhancers, silencers) and avoid confounding signals from promoters or gene bodies. They give you better power, cleaner biology, and more interpretable motif/enrichment results in ATAC‑seq analyses.
+
+In motif‐enrichment analyses you’re always fighting the fact that “open” vs. “closed” regions differ not just in the binding sites they harbor but also in basic sequence properties—GC content, length, mappability, etc.—that can themselves drive spurious “enrichment.”
+
+So there are two common approaches: 
+(1) With a *matched background* you explicitly sample a background set of peaks that have the same GC% and length distribution as your differential peaks.  Any motif that pops out beyond that background is much more likely to be a true, biology‐driven signal (e.g. a TF recruiting chromatin remodeling) rather than just binding where the sequence happens to be easy to cut or map.
+(2) With the *default/unselected background* you use all other peaks as background which gives you a broader view of any sequence‐level biases plus real TF preferences—so it’s more sensitive but less specific. 
+  •	The matched‐background run is more specific, ruling out GC or length effects.
+	•	The naïve‐background run is more sensitive, possibly catching weaker TF signals that get lost when you   aggressively control for sequence.
+
+If a motif is enriched under both schemes, you can be quite confident it’s biological (not an artifact of GC bias).  If it only shows up in the naïve run, it might be driven by sequence composition rather than true TF binding. Reviewers (and downstream users) often want to see both the “raw” enrichment and the “corrected” enrichment to understand how much your findings depend on background choice.
+
+### Motif Pairwise Comparisons
+```{r motif-enrich-comparisons}
+# Set assay to distal peaks for accessibility analysis
+DefaultAssay(Wt1pos) <- "distal_peaks"
+
+# Compute per‐peak statistics (length, GC.percent, etc.)
+Wt1pos <- RegionStats(
+  object = Wt1pos,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+
+# AF1 vs. SC myoFB
+da_peaks <- FindMarkers(
+  object = Wt1pos,
+  ident.1 = 'AF1',
+  ident.2 = 'SC myoFB',
+  only.pos = TRUE,
+  test.use = 'LR',
+  min.pct = 0.05,
+  latent.vars = 'nCount_peaks'
+)
+
+top.da.peak <- rownames(da_peaks[da_peaks$p_val < 0.005, ])
+
+# Find peaks accessible in both cell types and match GC content
+open.peaks <- AccessiblePeaks(Wt1pos, idents = c("AF1", "SC myoFB"))
+meta.feature <- GetAssayData(Wt1pos, assay = "distal_peaks", slot = "meta.features")
+peaks.matched <- MatchRegionStats(meta.feature = meta.feature[open.peaks, ], 
+                                  query.feature = meta.feature[top.da.peak, ], 
+                                  features.match   = c("GC.percent", "sequence.length"),
+                                  n = 50000)
+
+# Identify enriched motifs with selected background peaks
+enriched.motifs <- FindMotifs(object = Wt1pos, features = top.da.peak, background = peaks.matched)
+
+# Also run without a preselected background (optional)
+enriched.motifs1 <- FindMotifs(object = Wt1pos, features = top.da.peak)
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+pdf(paste(name, "_AF1vsSCmyoFB_motifplot_matchedbackground.pdf", sep=""))
+MotifPlot(Wt1pos, motifs = head(rownames(enriched.motifs))) + NoLegend()
+dev.off()
+
+pdf(paste(name, "_AF1vsSCmyoFB_motifplot_unselectedbackground.pdf", sep=""))
+MotifPlot(Wt1pos, motifs = head(rownames(enriched.motifs))) + NoLegend()
+dev.off()
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/csv')
+write.table(enriched.motifs, file = "Wt1pos_motif_AF1vsSCmyoFB__matchedbackground.csv")
+write.table(enriched.motifs1, file = "Wt1pos_motif_AF1vsSCmyoFB_unselectedbackground.csv")
+```
+
+## Additional Feature Plots for TEAD and WT1 Motifs
+
+Re-run chromVAR (if desired) using the full BSgenome and generate feature plots for several motifs.
+```{r featureplots}
+# Re-run chromVAR with the full genome
+Wt1pos <- RunChromVAR(Wt1pos, genome = BSgenome.Mmusculus.UCSC.mm10)
+DefaultAssay(Wt1pos) <- 'chromvar'
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+pdf(paste(name, "_TEAD1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0090.3", order = TRUE, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_TEAD2_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1121.1", order = TRUE, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_TEAD3_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0808.1", order = TRUE, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_TEAD4_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0809.2", order = TRUE, cols = c('lightgrey', 'brown'))
+dev.off()
+
+pdf(paste(name, "_WT1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1627.1", order = TRUE, cols = c('lightgrey', 'brown'))
+dev.off()
+```
+
+## Differential Motif Activity Scores Between Cell Types
+
+Compare motif activity between AF1 and numerous other cell types, and generate summary motif plots.
+```{r diff-motif-scores}
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/csv')
+differential.activity <- FindMarkers(
+  Wt1pos,
+  ident.1 = 'AF1',
+  ident.2 = c("Peribronchial FB", "Mesothelium"),
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+write.table(differential.activity, file = "Wt1pos_chromVAR_AF1-others.csv")
+
+differential.activity1 <- FindMarkers(
+  Wt1pos,
+  ident.2 = 'VSM',
+  ident.1 = c("SC myoFB", "Pericyte"),
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+write.table(differential.activity1, file = "Wt1pos_chromVAR_VSM-others.csv")
+
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+pdf(paste(name, "_topmotifplot.pdf", sep=""))
+MotifPlot(Wt1pos, motifs = head(rownames(differential.activity)), assay = 'distal_peaks') + NoLegend()
+dev.off()
+
+pdf(paste(name, "_topmotifplot1.pdf", sep=""))
+MotifPlot(Wt1pos, motifs = head(rownames(differential.activity1)), assay = 'distal_peaks')
+dev.off()
+
+pdf(paste(name, "_motifplot-top20.pdf", sep=""))
+MotifPlot(Wt1pos, motifs = head(rownames(differential.activity1), n = 20L), assay = 'distal_peaks')
+dev.off()
+
+pdf(paste(name, "_SMAD2_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1622.1", order = TRUE, min.cutoff = 'q10', max.cutoff = 'q90', pt.size = 0.2)
+dev.off()
+
+# Save the object after differential motif activity analysis
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds')
+saveRDS(Wt1pos, file = "Wt1pos_motifadded_chromVAR_09152022.rds")
+```
+
+### Final Heatmap of Top Differential Motifs
+```{r heatmaps}
+Wt1pos <- ScaleData(Wt1pos)
+pdf(paste(name, "_heatmap-top50.pdf", sep=""))
+DoHeatmap(Wt1pos, features = head(rownames(differential.activity1), n = 50L), disp.max = 1.5)
+dev.off()
+```
+
+## Additional Feature Plots for Figures
+
+Generate additional motif feature plots for figure panels.
+```{r add-featureplots}
+name_fig <- "scATAC_7DSham-PNX_chromVAR"
+
+pdf(paste(name_fig, "_TWIST1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1123.2", order = TRUE, min.cutoff = 'q5', max.cutoff = 'q90', pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+pdf(paste(name_fig, "_WT1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1627.1", order = TRUE, min.cutoff = 'q5', max.cutoff = 'q90', pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+pdf(paste(name_fig, "_Runx1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0002.2", order = TRUE, min.cutoff = 'q5', max.cutoff = 'q90', pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+saveRDS(Wt1pos, file = "scATAC_7DSham-PNX_motifadded_chromVAR_09122024.rds")
+```
+
+## Final Subsetting and Mesothelium-Only Motif Analysis
+
+Subset the data to mesothelium-related cell types, re-run motif analysis, and generate final feature plots.
+```{r mesothelium-only-analysis}
+# Subset to mesothelium and related cell types
+Wt1pos <- subset(Wt1pos, idents = c("Mesothelium", "Primed mesothelium", "Activated mesothelium 1", "Activated mesothelium 2"))
+
+# Re-load motif matrices
+motif.pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# Remove peaks on non-standard chromosomes
+main.chroms <- standardChromosomes(BSgenome.Mmusculus.UCSC.mm10)
+keep.peaks <- seqnames(granges(Wt1pos)) %in% main.chroms
+Wt1pos <- Wt1pos[keep.peaks, ]
+
+# Re-add motif annotations and re-run chromVAR
+Wt1pos <- AddMotifs(Wt1pos, genome = BSgenome.Mmusculus.UCSC.mm10, pfm = motif.pfm)
+Wt1pos <- RunChromVAR(Wt1pos, genome = BSgenome.Mmusculus.UCSC.mm10)
+DefaultAssay(Wt1pos) <- 'chromvar'
+
+name_meso <- "scATAC_7DSham-PNX_chromVAR_MesoOnly"
+pdf(paste(name_meso, "_TWIST1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1123.2", order = TRUE, pt.size = 0.2, cols = c('lightgrey', 'red'), min.cutoff = 'q5', max=cutoff = 'q80')
+dev.off()
+
+pdf(paste(name_meso, "_WT1_featureplot_test.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA1627.1", order = TRUE, pt.size = 0.2, cols = c('lightgrey', 'red'), max.cutoff = 2)
+dev.off()
+
+pdf(paste(name_meso, "_Runx1_featureplot.pdf", sep=""))
+FeaturePlot(Wt1pos, features = "MA0002.2", order = TRUE, min.cutoff = 'q5', max.cutoff = 'q80', pt.size = 0.2, cols = c('lightgrey', 'red'))
+dev.off()
+
+saveRDS(Wt1pos, file = "scATAC_7DSham-PNX_motifadded_chromVAR_MesoOnly_09122024.rds")
+```
+
