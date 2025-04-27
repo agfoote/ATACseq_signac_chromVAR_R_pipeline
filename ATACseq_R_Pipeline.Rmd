@@ -1,0 +1,265 @@
+---
+title: "ATAC-seq Processing Pipeline using Signac and Seurat"
+author: "Alexander G. Foote"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This pipeline processes raw ATAC-seq data from 10x Genomics. It includes steps for data loading, quality control (QC), doublet detection, normalization, dimensionality reduction, clustering, generating gene activity matrices, and saving processed objects. The analysis uses the Signac and Seurat frameworks for single-cell ATAC-seq data.
+
+## Set up workspace
+
+Load the raw count matrix and metadata from your 10x output, then create a ChromatinAssay and Seurat object. Also, add gene annotations using EnsDb.
+```{r package-load}
+library(Signac)
+library(Seurat)
+library(EnsDb.Mmusculus.v79)
+library(GenomicRanges)
+library(ggplot2)
+library(patchwork)
+library(Matrix)
+library(scCustomize)
+```
+
+### Import 'Function' for handling Multiple Samples & Automate Preprocessing/QC
+
+Blacklisted regions are genomic areas known to produce artificially high signals across sequencing experiments (such as snATAC-seq), independent of cell type or experimental condition, and thus are considered unreliable for accurate downstream analysis.
+```{r auto-data-loading}
+import_atac <- function(count_path, meta_path, fragment_path){
+  counts <- Read10X_h5(filename = count_path)
+  
+  meta <- read.csv(
+  file = meta_path,
+  header = TRUE,
+  row.names = 1)
+  
+  
+  
+    chrom_assay <- CreateChromatinAssay(
+    counts = counts,
+    sep = c(":", "-"),
+    genome = 'mm10',
+    fragments = fragment_path,
+    min.cells = 10,
+    min.features = 200
+  )
+  
+  data <- CreateSeuratObject(
+    counts = chrom_assay,
+    assay = "peaks",
+    meta.data = meta
+  )
+  
+  annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+  seqlevelsStyle(annotations) <- 'UCSC'
+  Annotation(data) <- annotations
+  
+  data <- NucleosomeSignal(object = data) #fragment ratio 147-294: <147  ---  mononucleosome:nucleosome-free
+  
+  
+  data <- TSSEnrichment(object = data, fast = FALSE)
+  
+  data$blacklist_ratio <- data$blacklist_region_fragments / data$peak_region_fragments
+  
+  data$pct_reads_in_peaks <- data$peak_region_fragments / data$passed_filters * 100 
+  
+  low_prf <- quantile(data[["peak_region_fragments"]]$peak_region_fragments, probs = 0.02) # Can adjust as see fit
+  hig_prf <- quantile(data[["peak_region_fragments"]]$peak_region_fragments, probs = 0.98)
+  low_prp <- quantile(data[["pct_reads_in_peaks"]]$pct_reads_in_peaks, probs = 0.02)
+  
+  high_blr <- quantile(data[["blacklist_ratio"]]$blacklist_ratio, probs = 0.98)
+  
+  hig_ns <- quantile(data[["nucleosome_signal"]]$nucleosome_signal, probs = 0.98)
+  
+  low_ts <- quantile(data[["TSS.enrichment"]]$TSS.enrichment, probs = 0.02)
+  
+  data <- subset(
+    x = data,
+    subset = peak_region_fragments > low_prf &
+      peak_region_fragments < hig_prf &
+      pct_reads_in_peaks > low_prp &
+      blacklist_ratio < high_blr &
+      nucleosome_signal < hig_ns &
+      TSS.enrichment > low_ts
+  )
+  
+  return(data)
+}
+```
+
+## Import datasets
+### Execute 'Function' for QC and Fragment Analysis -> Merge Samples and Save Object
+
+Compute QC metrics including nucleosome signal and TSS enrichment, visualize the fragment histogram and TSS plot, and generate violin plots for QC metrics.
+```{r}
+#Import per 'import_atac' function parameters (function(count_path, meta_path, fragment_path))
+young <- import_atac("/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723631_Young_HSC_filtered_peak_bc_matrix.h5",
+         '/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723631_Young_HSC_singlecell.csv',
+         '/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723631_Young_HSC_fragments.tsv.gz')
+
+old <- import_atac("/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723632_Aged_HSC_filtered_peak_bc_matrix.h5",
+         '/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723632_Aged_HSC_singlecell.csv',
+         '/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/GSE162662_RAW/GSM5723632_Aged_HSC_fragments.tsv.gz')
+
+# Classify and merge conditions, check metadata
+young$dataset <- "young"
+old$dataset <- "old"
+
+data <- merge(young, old)
+data@meta.data
+
+# Save rds
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds')
+saveRDS(data, file = "Control_Young-Old_HSC_Signac_GSE162662_RAW_AUTO_04212025.rds")
+```
+
+## Normalization and Dimensionality Reduction
+
+Run TF-IDF normalization, find top features, perform singular value decomposition (SVD) for dimensionality reduction, and check the depth correlation.
+```{r normalization-dimred}
+# Normalize using TF-IDF and find top features
+data <- RunTFIDF(data)
+data <- FindTopFeatures(data, min.cutoff = 'q0')
+
+# Run SVD (LSI) for dimensionality reduction (analgous to PCA for single-cell)
+data <- RunSVD(object = data, reduction.key = "LSI_", reduction.name = "lsi")
+
+# Plot depth correlation to inspect the first LSI component
+DepthCor(data)
+```
+
+## Non-linear Dimensionality Reduction and Clustering
+
+Run UMAP, compute neighbors, perform Leiden clustering, and visualize the clusters.
+```{r clustering-umap}
+# Run UMAP on LSI dimensions (excluding the first component)
+data <- RunUMAP(data, reduction = 'lsi', dims = 2:30)
+# Find neighbors and cluster the cells
+data <- FindNeighbors(data, reduction = 'lsi', dims = 2:30)
+data <- FindClusters(data, algorithm = 3, resolution = 0.5, verbose = FALSE)
+# Generate UMAP plot with cluster labels
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/plots')
+
+DimPlot(data, label = TRUE) + NoLegend()
+DimPlot(data, label = TRUE, group.by = "dataset") + NoLegend()
+```
+
+## Data Analysis
+
+### Gene Activity Matrix
+
+Compute a gene activity matrix, add it as a new assay to the Seurat object, normalize the data in this assay, and visualize gene expression.
+```{r gene-activity}
+# Compute the gene activity matrix
+gene.activities <- GeneActivity(data)
+# Add the gene activity matrix as a new assay to the Seurat object
+data[['RNA']] <- CreateAssayObject(counts = gene.activities)
+
+data <- NormalizeData(data,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(data$nCount_RNA)
+)
+data[['RNA']]
+```
+
+### Visualize selected genes
+```{r}
+DefaultAssay(data) <- 'RNA'
+# Generate feature plots for selected genes
+FeaturePlot_scCustom(data, 
+            features = c('Kit', 'Pecam1', 'Itgam'), 
+            colors_use= c("#E4E1E3FF","brown"), order = TRUE, pt.size = 0.1, max.cutoff = 'q95', na_cutoff =NULL, num_columns = 2)
+```
+
+### Find Differentially Accessible Peaks
+```{r}
+DefaultAssay(data) <- 'peaks'
+
+da_peaks <- FindMarkers(
+  object = data,
+  ident.1 = rownames(data[[]][data$dataset == "old",]),
+  ident.2 = rownames(data[[]][data$dataset == "young",]),
+  min.pct = 0.05,
+  test.use = 'LR',
+  latent.vars = 'peak_region_fragments'
+)
+
+da_peaks
+
+#Save da_peaks
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/csv')
+write.table(da_peaks,file="Young.vs.Old_HSC_dapeaks.csv",append = FALSE, quote = FALSE)
+```
+
+#### Find closest gene to DA peaks
+```{r}
+da_peaks$closest_gene <-ClosestFeature(data, regions = rownames(da_peaks))$gene_name
+da_peaks$distance <- ClosestFeature(data, regions = rownames(da_peaks))$distance
+da_peaks
+```
+
+#### CoveragePlots of DA peaks
+```{r}
+CoveragePlot(data,
+  region = rownames(da_peaks)[2], #looking at row 2 in da_peaks table (i.e. "Ehd1")
+  extend.upstream = 10000,
+  extend.downstream = 5000,
+  group.by = "dataset"
+)
+
+CoveragePlot(data,
+  region = "Aldh1a1", #defining specific gene to investigate
+  extend.upstream = 2000,
+  extend.downstream = 2000,
+  group.by = "dataset"
+)
+```
+
+#### Visualize chr regions as per condition
+```{r}
+# Specify by rowname in da_peaks table (i.e. "chr19-6295925-6310866, Ehd1")
+plot1 <- VlnPlot(
+  object = data,
+  features = rownames(da_peaks)[2],  
+  group.by = "dataset"
+)
+plot2 <- FeaturePlot(
+  object = data,
+  features = rownames(da_peaks)[2],
+  max.cutoff = 'q95'
+)
+
+plot1 | plot2
+
+# Specify by chr name in da_peaks table (i.e. "chr19-20599880-20607776, Aldh1a1")
+plot3 <- VlnPlot(
+  object   = data,
+  features = "chr19-20599880-20607776",
+  group.by = "dataset"
+)
+plot4 <- FeaturePlot(
+  object = data,
+  features = "chr19-20599880-20607776",
+  max.cutoff = 'q95'
+)
+
+plot3 | plot4
+```
+
+## Save Final Processed Object
+
+Save the fully processed object and a subset of clusters for further analysis.
+```{r save-objects}
+# Save the full processed object
+setwd('/Users/alexanderfoote/dev/Projs/R/ATAC-seq_Le_dataset/rds')
+saveRDS(data, file = "Young.vs.Old_HSC_Signac_GSE162662_PROCESSED_04212025.rds")
+
+# Create and save a refined subset containing selected clusters
+##subset <- subset(data, idents = c(0,1))
+##saveRDS(subset, file = "Control_Young-Old_HSC_Signac_GSE162662_PROCESSED_SUBSET_04212025.rds")
+```
